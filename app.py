@@ -5,6 +5,11 @@ from databricks import sql
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
 import os
+import folium
+from folium.plugins import Draw
+from streamlit_folium import st_folium
+from shapely.geometry import Point, Polygon
+import json
 
 # Page config
 st.set_page_config(
@@ -497,7 +502,7 @@ def get_connection():
 def query_data(state_filter=None, doc_type_filter=None, tenant_filter=None):
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     query = """
     SELECT 
         site_name,
@@ -517,19 +522,19 @@ def query_data(state_filter=None, doc_type_filter=None, tenant_filter=None):
         AND longitude IS NOT NULL
         AND lease_status = 'Active'
     """
-    
+
     if state_filter and state_filter != "All":
         query += f" AND state = '{state_filter}'"
     if doc_type_filter and doc_type_filter != "All":
         query += f" AND document_type = '{doc_type_filter}'"
     if tenant_filter and tenant_filter != "All":
         query += f" AND tenant_name = '{tenant_filter}'"
-    
+
     cursor.execute(query)
     result = cursor.fetchall()
     columns = [desc[0] for desc in cursor.description]
     cursor.close()
-    
+
     return pd.DataFrame(result, columns=columns)
 
 # Get filter options
@@ -537,21 +542,140 @@ def query_data(state_filter=None, doc_type_filter=None, tenant_filter=None):
 def get_filter_options():
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     # States
     cursor.execute("SELECT DISTINCT state FROM bricks_demo.crown_demo.synth_data WHERE state IS NOT NULL ORDER BY state")
     states = ["All"] + [row[0] for row in cursor.fetchall()]
-    
+
     # Document types
     cursor.execute("SELECT DISTINCT document_type FROM bricks_demo.crown_demo.synth_data WHERE document_type IS NOT NULL ORDER BY document_type")
     doc_types = ["All"] + [row[0] for row in cursor.fetchall()]
-    
+
     # Tenants
     cursor.execute("SELECT DISTINCT tenant_name FROM bricks_demo.crown_demo.synth_data WHERE tenant_name IS NOT NULL ORDER BY tenant_name")
     tenants = ["All"] + [row[0] for row in cursor.fetchall()]
-    
+
     cursor.close()
     return states, doc_types, tenants
+
+# Get site locations for Genie map
+@st.cache_data(ttl=300)
+def get_site_locations():
+    """Fetch all site locations for displaying on the Genie map"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    query = """
+    SELECT 
+        site_name,
+        latitude,
+        longitude,
+        state,
+        city,
+        tenant_name,
+        total_monthly_revenue
+    FROM bricks_demo.crown_demo.synth_data
+    WHERE latitude IS NOT NULL 
+        AND longitude IS NOT NULL
+    """
+
+    cursor.execute(query)
+    result = cursor.fetchall()
+    columns = [desc[0] for desc in cursor.description]
+    cursor.close()
+
+    return pd.DataFrame(result, columns=columns)
+
+def check_point_in_polygon(lat, lon, polygon_coords):
+    """Check if a point is inside a polygon using Shapely (for map highlighting)"""
+    try:
+        point = Point(lon, lat)  # Note: shapely uses (lon, lat) order
+        polygon = Polygon(polygon_coords)
+        # Use intersects to match Databricks ST_Intersects behavior (includes boundary)
+        return polygon.intersects(point)
+    except:
+        return False
+
+def count_sites_in_polygon_db(polygon_coords):
+    """Query Databricks directly to count sites in polygon using ST_Intersects"""
+    if not polygon_coords:
+        return 0
+
+    try:
+        # Build WKT polygon string
+        wkt_coords = ", ".join([f"{coord[0]:.6f} {coord[1]:.6f}" for coord in polygon_coords])
+
+        # Ensure polygon is closed
+        first_coord = polygon_coords[0]
+        last_coord = polygon_coords[-1]
+        if first_coord[0] != last_coord[0] or first_coord[1] != last_coord[1]:
+            wkt_coords += f", {first_coord[0]:.6f} {first_coord[1]:.6f}"
+
+        wkt_polygon = f"POLYGON(({wkt_coords}))"
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        query = f"""
+        SELECT COUNT(DISTINCT site_name) as cnt
+        FROM bricks_demo.crown_demo.synth_data
+        WHERE latitude IS NOT NULL 
+            AND longitude IS NOT NULL
+            AND ST_Intersects(
+                ST_GeomFromWKT('{wkt_polygon}'),
+                ST_Point(longitude, latitude)
+            )
+        """
+
+        cursor.execute(query)
+        result = cursor.fetchone()
+        cursor.close()
+
+        return result[0] if result else 0
+    except Exception as e:
+        # Fall back to local calculation if DB query fails
+        return -1  # Return -1 to indicate error
+
+def format_polygon_for_query(polygon_coords):
+    """Format polygon coordinates using Databricks ST geospatial functions for Genie"""
+    if not polygon_coords:
+        return ""
+
+    # Build WKT (Well-Known Text) polygon string
+    # Folium returns coords as [longitude, latitude], WKT expects "longitude latitude"
+    wkt_coords = ", ".join([f"{coord[0]:.6f} {coord[1]:.6f}" for coord in polygon_coords])
+
+    # Ensure polygon is closed (first point = last point)
+    first_coord = polygon_coords[0]
+    last_coord = polygon_coords[-1]
+    if first_coord[0] != last_coord[0] or first_coord[1] != last_coord[1]:
+        wkt_coords += f", {first_coord[0]:.6f} {first_coord[1]:.6f}"
+
+    wkt_polygon = f"POLYGON(({wkt_coords}))"
+
+    # Build the ST_Intersects filter clause (includes points on boundary, unlike ST_Contains)
+    st_filter = f"""ST_Intersects(
+    ST_GeomFromWKT('{wkt_polygon}'),
+    ST_Point(longitude, latitude)
+)"""
+
+    return f"""
+[GEOGRAPHIC FILTER ACTIVE - USE DATABRICKS ST FUNCTIONS]
+The user has drawn a polygon on the map. You MUST filter results to only include sites within this polygon.
+
+Use this exact WHERE clause filter:
+```sql
+WHERE {st_filter}
+```
+
+The polygon WKT: {wkt_polygon}
+
+IMPORTANT: 
+- Use ST_Intersects (not ST_Contains) to include points on the polygon boundary
+- ST_GeomFromWKT creates the polygon geometry from WKT format
+- ST_Point(longitude, latitude) creates a point - longitude is first, latitude is second
+- Include this filter in your SQL query to get only sites within the drawn polygon
+"""
 
 # Main app
 def main():
@@ -562,11 +686,11 @@ def main():
         <div class="app-subtitle">Demo MVP • Powered by Databricks</div>
     </div>
     """, unsafe_allow_html=True)
-    
+
     # Initialize tab state
     if 'active_tab' not in st.session_state:
         st.session_state.active_tab = 0
-    
+
     # Tab navigation - horizontal buttons
     tabs = [
         ("📊", "Dashboard"),
@@ -574,7 +698,7 @@ def main():
         ("📚", "Knowledge Assistant"),
         ("👥", "Multi-Agent Supervisor")
     ]
-    
+
     cols = st.columns(len(tabs))
     for i, (icon, label) in enumerate(tabs):
         with cols[i]:
@@ -582,9 +706,9 @@ def main():
             if st.button(f"{icon} {label}", key=f"tab_{i}", type=btn_type, use_container_width=True):
                 st.session_state.active_tab = i
                 st.rerun()
-    
+
     st.markdown("<br>", unsafe_allow_html=True)
-    
+
     # Show selected tab content
     if st.session_state.active_tab == 0:
         show_dashboard()
@@ -597,15 +721,15 @@ def main():
 
 def show_dashboard():
     st.markdown('<div class="section-header">📊 Lease Portfolio Overview</div>', unsafe_allow_html=True)
-    
+
     # Get filter options
     try:
         states, doc_types, tenants = get_filter_options()
-        
+
         # Initialize session state for site filter
         if 'selected_site' not in st.session_state:
             st.session_state.selected_site = None
-        
+
         # Filters in columns
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -614,41 +738,41 @@ def show_dashboard():
             doc_type_filter = st.selectbox("Document Type", doc_types)
         with col3:
             tenant_filter = st.selectbox("Tenant Name", tenants)
-        
+
         # Query data with site filter
         df = query_data(state_filter, doc_type_filter, tenant_filter)
-        
+
         # Apply site filter if selected from map
         if st.session_state.selected_site:
             df = df[df['site_name'] == st.session_state.selected_site]
             st.info(f"🎯 Showing: **{st.session_state.selected_site}** — Click the site again or 'Clear' to see all sites")
         else:
             st.info(f"📊 Showing: **All Sites** ({len(df)} total) — Click any marker on the map to filter")
-        
+
         if df.empty:
             st.warning("No data found for the selected filters.")
             return
-        
+
         # Convert numeric columns to proper types
-        numeric_columns = ['total_monthly_revenue', 'revenue_per_sqft', 'days_until_expiration', 
-                          'insurance_liability_min_usd', 'equipment_space_sqft']
+        numeric_columns = ['total_monthly_revenue', 'revenue_per_sqft', 'days_until_expiration',
+                           'insurance_liability_min_usd', 'equipment_space_sqft']
         for col in numeric_columns:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-        
+
         # Metrics row with custom styled cards
         total_revenue = df['total_monthly_revenue'].sum()
         num_leases = len(df)
         avg_days_remaining = df['days_until_expiration'].mean()
         avg_revenue_per_sqft = df['revenue_per_sqft'].mean()
-        
+
         # Handle NaN values safely
         total_revenue = 0 if pd.isna(total_revenue) else total_revenue
         avg_days_remaining = 0 if pd.isna(avg_days_remaining) else avg_days_remaining
         avg_revenue_per_sqft = 0 if pd.isna(avg_revenue_per_sqft) else avg_revenue_per_sqft
-        
+
         metric1, metric2, metric3, metric4 = st.columns(4)
-        
+
         with metric1:
             st.markdown(f'''
             <div class="metric-card">
@@ -677,9 +801,9 @@ def show_dashboard():
                 <div class="metric-value">${avg_revenue_per_sqft:,.2f}</div>
             </div>
             ''', unsafe_allow_html=True)
-        
+
         st.markdown("<br>", unsafe_allow_html=True)
-        
+
         # Map header with Clear button tightly aligned
         st.markdown("""
         <style>
@@ -698,7 +822,7 @@ def show_dashboard():
             }
         </style>
         """, unsafe_allow_html=True)
-        
+
         col1, col2, col3 = st.columns([0.12, 0.08, 0.80])
         with col1:
             st.markdown('<div class="section-header" style="margin: 0; white-space: nowrap;">📍 Site Locations</div>', unsafe_allow_html=True)
@@ -708,16 +832,16 @@ def show_dashboard():
                     st.session_state.selected_site = None
                     st.rerun()
         # col3 is empty spacer
-        
+
         st.caption("🖱️ Click on any site marker to filter the dashboard to that site")
-        
+
         # Get unfiltered data for map (to show all sites even when one is selected)
         df_all_sites = query_data(state_filter, doc_type_filter, tenant_filter)
-        
+
         # Create a copy for display and clean data
         df_display = df_all_sites.copy()
         df_display = df_display.dropna(subset=['total_monthly_revenue', 'latitude', 'longitude'])
-        
+
         if df_display.empty:
             st.warning("No valid site location data available.")
         else:
@@ -725,12 +849,12 @@ def show_dashboard():
             df_display['total_monthly_revenue'] = pd.to_numeric(df_display['total_monthly_revenue'], errors='coerce')
             df_display['revenue_per_sqft'] = pd.to_numeric(df_display['revenue_per_sqft'], errors='coerce')
             df_display = df_display.dropna(subset=['total_monthly_revenue'])
-            
+
             # Reset index to ensure proper mapping with selection
             df_display = df_display.reset_index(drop=True)
-            
+
             df_display['revenue_display'] = df_display['total_monthly_revenue'].apply(lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A")
-            
+
             # Highlight selected site if any
             selected_site = st.session_state.get('selected_site', None)
             if selected_site:
@@ -743,7 +867,7 @@ def show_dashboard():
             else:
                 df_display['marker_size'] = [12] * len(df_display)
                 df_display['marker_color'] = ['#2196F3'] * len(df_display)
-            
+
             fig = px.scatter_mapbox(
                 df_display,
                 lat='latitude',
@@ -765,20 +889,20 @@ def show_dashboard():
                 height=500,
                 labels={'revenue_display': 'Monthly Revenue', 'revenue_per_sqft': 'Revenue/Sq Ft'}
             )
-            
+
             # Update marker colors for selected site
             if selected_site:
                 colors = df_display['marker_color'].tolist()
                 fig.update_traces(marker=dict(color=colors))
-            
+
             fig.update_layout(
                 mapbox_style="open-street-map",
                 margin={"r": 0, "t": 0, "l": 0, "b": 0}
             )
-            
+
             # Make map clickable with selection
             event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", selection_mode="points", key="map_select")
-            
+
             # Handle map click selection (toggle behavior)
             if event and event.selection and event.selection.points:
                 clicked_point = event.selection.points[0]
@@ -791,26 +915,26 @@ def show_dashboard():
                     else:
                         st.session_state.selected_site = clicked_site  # Select new
                     st.rerun()
-        
+
         # Data table - using Pandas Styler for visibility
         st.markdown('<div class="section-header">📋 Detailed Data</div>', unsafe_allow_html=True)
-        
+
         # Prepare data for display
         display_df = df[[
             'site_name', 'state', 'tenant_name', 'document_type',
-            'total_monthly_revenue', 'revenue_per_sqft', 
+            'total_monthly_revenue', 'revenue_per_sqft',
             'days_until_expiration', 'insurance_liability_min_usd'
         ]].sort_values('total_monthly_revenue', ascending=False).head(50).copy()
-        
+
         # Format numeric columns
         display_df['total_monthly_revenue'] = display_df['total_monthly_revenue'].apply(lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A")
         display_df['revenue_per_sqft'] = display_df['revenue_per_sqft'].apply(lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A")
         display_df['days_until_expiration'] = display_df['days_until_expiration'].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "N/A")
         display_df['insurance_liability_min_usd'] = display_df['insurance_liability_min_usd'].apply(lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A")
-        
+
         # Rename columns for display
         display_df.columns = ['Site Name', 'State', 'Tenant', 'Document Type', 'Monthly Revenue', 'Revenue/SqFt', 'Days Remaining', 'Insurance Liability']
-        
+
         # Use st.table with custom styling (simpler and more reliable)
         st.markdown("""
         <style>
@@ -831,9 +955,9 @@ def show_dashboard():
             }
         </style>
         """, unsafe_allow_html=True)
-        
+
         st.table(display_df)
-        
+
     except Exception as e:
         st.error(f"Error loading dashboard: {str(e)}")
         st.info("Please ensure the SQL Warehouse is running and you have proper access to the data.")
@@ -846,10 +970,10 @@ def show_genie_space():
         <p style="color: #666; margin: 0.25rem 0 0 0; font-size: 0.9rem;">Powered by Databricks Genie Space</p>
     </div>
     """, unsafe_allow_html=True)
-    
+
     # Get Genie Space ID from environment or config
     genie_space_id = os.environ.get("GENIE_SPACE_ID", "")
-    
+
     if not genie_space_id:
         st.warning("⚠️ No Genie Space configured for this app.")
         st.info("""
@@ -864,47 +988,240 @@ def show_genie_space():
         - 👥 Multi-Agent Supervisor - Complex tasks
         """)
         return
-    
-    # Initialize session state for chat history
+
+    # Initialize session state for chat history and polygon
     if 'genie_messages' not in st.session_state:
         st.session_state.genie_messages = []
-    
+    if 'drawn_polygon' not in st.session_state:
+        st.session_state.drawn_polygon = None
+    if 'sites_in_polygon' not in st.session_state:
+        st.session_state.sites_in_polygon = 0
+
+    # ============ INTERACTIVE MAP WITH POLYGON DRAWING ============
+    st.markdown("""
+    <div style="margin-bottom: 0.5rem;">
+        <h3 style="color: #1a1a1a; margin: 0; font-size: 1.1rem;">🗺️ Draw a Region to Query</h3>
+        <p style="color: #666; margin: 0.25rem 0 0 0; font-size: 0.85rem;">
+            Draw a polygon on the map to select sites, then ask questions about sites in that area.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Create two columns - map and info panel
+    map_col, info_col = st.columns([3, 1])
+
+    with map_col:
+        try:
+            # Get site locations for the map
+            sites_df = get_site_locations()
+
+            if not sites_df.empty:
+                # Calculate map center
+                center_lat = sites_df['latitude'].astype(float).mean()
+                center_lon = sites_df['longitude'].astype(float).mean()
+            else:
+                center_lat, center_lon = 39.8283, -98.5795  # Center of US
+
+            # Create folium map
+            m = folium.Map(
+                location=[center_lat, center_lon],
+                zoom_start=4,
+                tiles='OpenStreetMap'
+            )
+
+            # Add Draw plugin for polygon drawing
+            draw = Draw(
+                export=False,
+                position='topleft',
+                draw_options={
+                    'polyline': False,
+                    'rectangle': True,
+                    'polygon': True,
+                    'circle': False,
+                    'marker': False,
+                    'circlemarker': False,
+                },
+                edit_options={
+                    'edit': True,
+                    'remove': True
+                }
+            )
+            draw.add_to(m)
+
+            # Add site markers to the map
+            if not sites_df.empty:
+                for _, row in sites_df.iterrows():
+                    try:
+                        lat = float(row['latitude'])
+                        lon = float(row['longitude'])
+                        site_name = str(row['site_name'])
+                        state = str(row.get('state', 'N/A'))
+                        city = str(row.get('city', 'N/A'))
+                        revenue = row.get('total_monthly_revenue', 0)
+
+                        # Check if site is in selected polygon
+                        is_in_polygon = False
+                        if st.session_state.drawn_polygon:
+                            is_in_polygon = check_point_in_polygon(lat, lon, st.session_state.drawn_polygon)
+
+                        # Color based on selection
+                        marker_color = '#e63946' if is_in_polygon else '#2196F3'
+
+                        popup_html = f"""
+                        <div style="font-family: Arial; width: 200px;">
+                            <b>{site_name}</b><br>
+                            📍 {city}, {state}<br>
+                            💰 ${revenue:,.0f}/month
+                        </div>
+                        """
+
+                        folium.CircleMarker(
+                            location=[lat, lon],
+                            radius=6 if not is_in_polygon else 8,
+                            popup=folium.Popup(popup_html, max_width=250),
+                            color=marker_color,
+                            fill=True,
+                            fillColor=marker_color,
+                            fillOpacity=0.7,
+                            weight=2
+                        ).add_to(m)
+                    except (ValueError, TypeError):
+                        continue
+
+            # Render the map and capture drawn shapes
+            map_data = st_folium(
+                m,
+                height=400,
+                width=None,
+                returned_objects=["all_drawings"],
+                key="genie_map"
+            )
+
+            # Process drawn shapes
+            if map_data and map_data.get("all_drawings"):
+                drawings = map_data["all_drawings"]
+                if drawings:
+                    # Get the last drawn shape
+                    last_drawing = drawings[-1]
+                    if last_drawing.get("geometry", {}).get("type") in ["Polygon", "Rectangle"]:
+                        coords = last_drawing["geometry"]["coordinates"][0]
+                        # Folium returns [lon, lat], keep as is for shapely
+                        st.session_state.drawn_polygon = coords
+
+                        # Count sites in polygon using Databricks ST_Intersects (same as Genie query)
+                        count = count_sites_in_polygon_db(coords)
+                        if count == -1:
+                            # Fallback to local count if DB query failed
+                            count = 0
+                            if not sites_df.empty:
+                                for _, row in sites_df.iterrows():
+                                    try:
+                                        lat = float(row['latitude'])
+                                        lon = float(row['longitude'])
+                                        if check_point_in_polygon(lat, lon, coords):
+                                            count += 1
+                                    except:
+                                        continue
+                        st.session_state.sites_in_polygon = count
+                else:
+                    # No drawings - clear polygon if it was set
+                    if st.session_state.drawn_polygon and not drawings:
+                        st.session_state.drawn_polygon = None
+                        st.session_state.sites_in_polygon = 0
+
+        except Exception as e:
+            st.warning(f"Could not load map: {str(e)}")
+            st.info("You can still chat with Genie without the map.")
+
+    with info_col:
+        st.markdown("""
+        <div style="background: #f8f9fa; border-radius: 8px; padding: 1rem; height: 100%;">
+            <h4 style="color: #1a1a1a; margin: 0 0 0.75rem 0; font-size: 0.95rem;">📌 How to Use</h4>
+            <ol style="color: #666; font-size: 0.8rem; padding-left: 1.2rem; margin: 0;">
+                <li style="margin-bottom: 0.5rem;">Click the polygon 🔷 or rectangle ⬜ tool on the map</li>
+                <li style="margin-bottom: 0.5rem;">Draw a shape around the area you want to query</li>
+                <li style="margin-bottom: 0.5rem;">Ask a question about sites in that area</li>
+            </ol>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<div style='height: 0.5rem;'></div>", unsafe_allow_html=True)
+
+        # Show polygon status
+        if st.session_state.drawn_polygon:
+            st.success(f"✅ **{st.session_state.sites_in_polygon}** sites selected")
+            if st.button("🗑️ Clear Selection", key="clear_polygon"):
+                st.session_state.drawn_polygon = None
+                st.session_state.sites_in_polygon = 0
+                st.rerun()
+        else:
+            st.info("No area selected")
+
+        # Suggested queries when polygon is drawn
+        if st.session_state.drawn_polygon:
+            st.markdown("""
+            <div style="margin-top: 0.75rem;">
+                <p style="color: #666; font-size: 0.8rem; margin-bottom: 0.5rem;"><b>Try asking:</b></p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            example_queries = [
+                "How many sites are in this area?",
+                "What's the total revenue in this region?",
+                "Show me all sites in this polygon",
+                "Which tenants are in this area?"
+            ]
+            for query in example_queries:
+                st.markdown(f"<span style='color: #2196F3; font-size: 0.75rem;'>• {query}</span>", unsafe_allow_html=True)
+
+    st.markdown("---")
+
     # Clear chat history button (only show if there's history)
     if st.session_state.genie_messages:
         if st.button("🗑️ Clear Chat History", key="clear_genie"):
             st.session_state.genie_messages = []
             st.rerun()
         st.markdown("---")
-    
+
     # Display chat history (only completed exchanges)
     for message in st.session_state.genie_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-    
+
     # Chat input
-    if prompt := st.chat_input("Ask about your lease data..."):
+    placeholder_text = "Ask about sites in the selected area..." if st.session_state.drawn_polygon else "Ask about your lease data..."
+
+    if prompt := st.chat_input(placeholder_text):
         # Display user message (don't add to history yet)
         with st.chat_message("user"):
             st.markdown(prompt)
-        
+            if st.session_state.drawn_polygon:
+                st.caption(f"🗺️ Query includes {st.session_state.sites_in_polygon} sites from selected polygon")
+
+        # Build the enhanced prompt with polygon context if available
+        enhanced_prompt = prompt
+        if st.session_state.drawn_polygon:
+            polygon_context = format_polygon_for_query(st.session_state.drawn_polygon)
+            enhanced_prompt = f"{prompt}\n\n{polygon_context}"
+
         # Get response from Genie
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
                     import time
-                    
+
                     # Start a conversation using SDK
                     start_response = w.api_client.do(
                         'POST',
                         f'/api/2.0/genie/spaces/{genie_space_id}/start-conversation',
-                        body={"content": prompt},
+                        body={"content": enhanced_prompt},
                         headers={'Content-Type': 'application/json'}
                     )
-                    
+
                     conversation_id = start_response.get("conversation", {}).get("id")
                     message_data = start_response.get("message", {})
                     message_id = message_data.get("id")
-                    
+
                     # Poll for the response
                     max_attempts = 30
                     for _ in range(max_attempts):
@@ -913,40 +1230,40 @@ def show_genie_space():
                             f'/api/2.0/genie/spaces/{genie_space_id}/conversations/{conversation_id}/messages/{message_id}',
                             headers={'Content-Type': 'application/json'}
                         )
-                        
+
                         status = message_status.get("status")
-                        
+
                         if status == "COMPLETED":
                             # Extract response content
                             attachments = message_status.get("attachments", [])
                             response_parts = []
                             sql_query = None
-                            
+
                             # Get statement_id from message level
                             statement_id_from_message = message_status.get("query_result", {}).get("statement_id")
-                            
+
                             for attachment in attachments:
                                 # Get text explanations
                                 if "text" in attachment:
                                     text_data = attachment["text"]
                                     if "content" in text_data:
                                         response_parts.append(text_data['content'])
-                                
+
                                 # Get query results
                                 if "query" in attachment:
                                     query_data = attachment["query"]
-                                    
+
                                     # Store SQL query
                                     if "query" in query_data:
                                         sql_query = query_data['query']
-                                    
+
                                     # Get statement_id
                                     statement_id = None
                                     if "query_result_metadata" in query_data and "statement_id" in query_data["query_result_metadata"]:
                                         statement_id = query_data["query_result_metadata"]["statement_id"]
                                     elif statement_id_from_message:
                                         statement_id = statement_id_from_message
-                                    
+
                                     if statement_id:
                                         try:
                                             # Fetch query results
@@ -955,10 +1272,10 @@ def show_genie_space():
                                                 f'/api/2.0/sql/statements/{statement_id}',
                                                 headers={'Content-Type': 'application/json'}
                                             )
-                                            
+
                                             stmt_data = result_response.get("statement_response", result_response)
                                             stmt_status = stmt_data.get("status", {}).get("state")
-                                            
+
                                             if stmt_status == "SUCCEEDED":
                                                 if "result" in stmt_data and "data_array" in stmt_data["result"]:
                                                     data = stmt_data["result"]["data_array"]
@@ -967,12 +1284,12 @@ def show_genie_space():
                                                         columns = []
                                                         if "manifest" in stmt_data and "schema" in stmt_data["manifest"]:
                                                             columns = [col["name"] for col in stmt_data["manifest"]["schema"]["columns"]]
-                                                        
+
                                                         # Check if data has lat/long for map visualization
                                                         lat_col = None
                                                         lon_col = None
                                                         name_col = None
-                                                        
+
                                                         for i, col in enumerate(columns):
                                                             col_lower = col.lower()
                                                             if 'lat' in col_lower:
@@ -981,11 +1298,11 @@ def show_genie_space():
                                                                 lon_col = i
                                                             if 'name' in col_lower or 'site' in col_lower:
                                                                 name_col = i
-                                                        
+
                                                         # If we have lat/long, create a map
                                                         if lat_col is not None and lon_col is not None:
                                                             response_parts.append("\n**📍 Map View:**\n")
-                                                            
+
                                                             # Build dataframe for map
                                                             map_data = []
                                                             for row in data:
@@ -1002,10 +1319,10 @@ def show_genie_space():
                                                                         })
                                                                 except (ValueError, TypeError):
                                                                     continue
-                                                            
+
                                                             if map_data:
                                                                 map_df = pd.DataFrame(map_data)
-                                                                
+
                                                                 # Create map
                                                                 fig = px.scatter_mapbox(
                                                                     map_df,
@@ -1021,38 +1338,38 @@ def show_genie_space():
                                                                     margin={"r": 0, "t": 0, "l": 0, "b": 0}
                                                                 )
                                                                 st.plotly_chart(fig, use_container_width=True)
-                                                        
+
                                                         # Always show data table
                                                         response_parts.append("\n**Query Results:**\n")
-                                                        
+
                                                         if columns:
                                                             # Create markdown table
                                                             header = "| " + " | ".join(columns) + " |"
                                                             separator = "| " + " | ".join(["---"] * len(columns)) + " |"
                                                             rows = [header, separator]
-                                                            
+
                                                             for row in data[:20]:
                                                                 row_str = "| " + " | ".join([str(val) if val is not None else "" for val in row]) + " |"
                                                                 rows.append(row_str)
-                                                            
+
                                                             response_parts.append("\n".join(rows))
-                                                            
+
                                                             if len(data) > 20:
                                                                 response_parts.append(f"\n*({len(data) - 20} more rows...)*")
                                         except Exception as e:
                                             response_parts.append(f"\n_Could not fetch query results: {str(e)}_")
-                            
+
                             if not response_parts:
                                 response_parts.append("Query completed successfully!")
-                            
+
                             answer = "\n".join(response_parts)
                             st.markdown(answer)
-                            
+
                             # Show SQL query in expander if available
                             if sql_query:
                                 with st.expander("📝 View SQL Query"):
                                     st.code(sql_query, language='sql')
-                            
+
                             # Add both user and assistant messages to history together
                             st.session_state.genie_messages.append({"role": "user", "content": prompt})
                             st.session_state.genie_messages.append({"role": "assistant", "content": answer})
@@ -1068,18 +1385,18 @@ def show_genie_space():
                             st.session_state.genie_messages.append({"role": "user", "content": prompt})
                             st.session_state.genie_messages.append({"role": "assistant", "content": f"❌ Error: {error_msg}"})
                             break
-                        
+
                         time.sleep(1)
                     else:
                         timeout_msg = "Query is taking longer than expected. Please try again."
                         st.warning(timeout_msg)
                         st.session_state.genie_messages.append({"role": "user", "content": prompt})
                         st.session_state.genie_messages.append({"role": "assistant", "content": timeout_msg})
-                        
+
                 except Exception as e:
                     error_msg = f"Error communicating with Genie Space: {str(e)}"
                     st.error(error_msg)
-                    
+
                     if "does not exist" in str(e) or "permission" in str(e).lower() or "unauthorized" in str(e).lower():
                         st.info("""
                         💡 **This is likely a permissions issue.**
@@ -1096,7 +1413,7 @@ def show_genie_space():
                         - 📚 Knowledge Assistant (fast document Q&A)
                         - 👥 Multi-Agent Supervisor (complex tasks)
                         """)
-                    
+
                     st.session_state.genie_messages.append({"role": "user", "content": prompt})
                     st.session_state.genie_messages.append({"role": "assistant", "content": error_msg})
 
@@ -1108,39 +1425,39 @@ def show_knowledge_assistant():
         <p style="color: #666; margin: 0.25rem 0 0 0; font-size: 0.9rem;">Powered by Document RAG</p>
     </div>
     """, unsafe_allow_html=True)
-    
+
     # Initialize session state for chat history
     if 'ka_messages' not in st.session_state:
         st.session_state.ka_messages = []
-    
+
     # Clear chat history button (only show if there's history)
     if st.session_state.ka_messages:
         if st.button("🗑️ Clear Chat History", key="clear_ka"):
             st.session_state.ka_messages = []
             st.rerun()
         st.markdown("---")
-    
+
     # Display chat history (only completed exchanges)
     for message in st.session_state.ka_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-    
+
     # Chat input
     if prompt := st.chat_input("Ask about lease agreements, contracts, or policies..."):
         # Display user message (don't add to history yet)
         with st.chat_message("user"):
             st.markdown(prompt)
-        
+
         # Get response from Knowledge Assistant
         with st.chat_message("assistant"):
             with st.spinner("Searching knowledge base..."):
                 try:
                     endpoint_name = "ka-870aa40a-endpoint"
-                    
+
                     # Build input messages including history and current prompt
                     input_messages = [{"role": msg["role"], "content": msg["content"]} for msg in st.session_state.ka_messages]
                     input_messages.append({"role": "user", "content": prompt})
-                    
+
                     # Use SDK's api_client.do() which handles auth automatically
                     response = w.api_client.do(
                         'POST',
@@ -1151,11 +1468,11 @@ def show_knowledge_assistant():
                         },
                         headers={'Content-Type': 'application/json'}
                     )
-                    
+
                     # Parse agent response from output array
                     assistant_message = ""
                     output = response.get("output", [])
-                    
+
                     # Extract message content from agent response
                     for item in output:
                         if item.get("type") == "message" and item.get("role") == "assistant":
@@ -1163,7 +1480,7 @@ def show_knowledge_assistant():
                             for content_item in content:
                                 if content_item.get("type") == "output_text":
                                     assistant_message += content_item.get("text", "")
-                    
+
                     # Fallback: try other response formats
                     if not assistant_message and isinstance(output, str):
                         assistant_message = output
@@ -1171,16 +1488,16 @@ def show_knowledge_assistant():
                         for item in output:
                             if "text" in item:
                                 assistant_message += str(item.get("text", ""))
-                    
+
                     if not assistant_message:
                         assistant_message = "I apologize, but I couldn't generate a response. Please try again."
-                    
+
                     st.markdown(assistant_message)
-                    
+
                     # Add both user and assistant messages to history together
                     st.session_state.ka_messages.append({"role": "user", "content": prompt})
                     st.session_state.ka_messages.append({"role": "assistant", "content": assistant_message})
-                        
+
                 except Exception as e:
                     error_msg = f"Error: {str(e)}"
                     st.error(error_msg)
@@ -1195,51 +1512,227 @@ def show_multi_agent_supervisor():
         <p style="color: #666; margin: 0.25rem 0 0 0; font-size: 0.9rem;">Powered by Multi-Agent Supervisor</p>
     </div>
     """, unsafe_allow_html=True)
-    
-    # Initialize session state for chat history
+
+    # Initialize session state for chat history and polygon
     if 'mas_messages' not in st.session_state:
         st.session_state.mas_messages = []
-    
+    if 'mas_drawn_polygon' not in st.session_state:
+        st.session_state.mas_drawn_polygon = None
+    if 'mas_sites_in_polygon' not in st.session_state:
+        st.session_state.mas_sites_in_polygon = 0
+
+    # ============ INTERACTIVE MAP WITH POLYGON DRAWING ============
+    st.markdown("""
+    <div style="margin-bottom: 0.5rem;">
+        <h3 style="color: #1a1a1a; margin: 0; font-size: 1.1rem;">🗺️ Draw a Region to Query</h3>
+        <p style="color: #666; margin: 0.25rem 0 0 0; font-size: 0.85rem;">
+            Draw a polygon on the map to select sites, then ask questions about sites in that area.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Create two columns - map and info panel
+    map_col, info_col = st.columns([3, 1])
+
+    with map_col:
+        try:
+            # Get site locations for the map
+            sites_df = get_site_locations()
+
+            if not sites_df.empty:
+                # Calculate map center
+                center_lat = sites_df['latitude'].astype(float).mean()
+                center_lon = sites_df['longitude'].astype(float).mean()
+            else:
+                center_lat, center_lon = 39.8283, -98.5795  # Center of US
+
+            # Create folium map
+            m = folium.Map(
+                location=[center_lat, center_lon],
+                zoom_start=4,
+                tiles='OpenStreetMap'
+            )
+
+            # Add Draw plugin for polygon drawing
+            draw = Draw(
+                export=False,
+                position='topleft',
+                draw_options={
+                    'polyline': False,
+                    'rectangle': True,
+                    'polygon': True,
+                    'circle': False,
+                    'marker': False,
+                    'circlemarker': False,
+                },
+                edit_options={
+                    'edit': True,
+                    'remove': True
+                }
+            )
+            draw.add_to(m)
+
+            # Add site markers to the map
+            if not sites_df.empty:
+                for _, row in sites_df.iterrows():
+                    try:
+                        lat = float(row['latitude'])
+                        lon = float(row['longitude'])
+                        site_name = str(row['site_name'])
+                        state = str(row.get('state', 'N/A'))
+                        city = str(row.get('city', 'N/A'))
+                        revenue = row.get('total_monthly_revenue', 0)
+
+                        # Check if site is in selected polygon
+                        is_in_polygon = False
+                        if st.session_state.mas_drawn_polygon:
+                            is_in_polygon = check_point_in_polygon(lat, lon, st.session_state.mas_drawn_polygon)
+
+                        # Color based on selection
+                        marker_color = '#e63946' if is_in_polygon else '#2196F3'
+
+                        popup_html = f"""
+                        <div style="font-family: Arial; width: 200px;">
+                            <b>{site_name}</b><br>
+                            📍 {city}, {state}<br>
+                            💰 ${revenue:,.0f}/month
+                        </div>
+                        """
+
+                        folium.CircleMarker(
+                            location=[lat, lon],
+                            radius=6 if not is_in_polygon else 8,
+                            popup=folium.Popup(popup_html, max_width=250),
+                            color=marker_color,
+                            fill=True,
+                            fillColor=marker_color,
+                            fillOpacity=0.7,
+                            weight=2
+                        ).add_to(m)
+                    except (ValueError, TypeError):
+                        continue
+
+            # Render the map and capture drawn shapes
+            map_data = st_folium(
+                m,
+                height=400,
+                width=None,
+                returned_objects=["all_drawings"],
+                key="mas_map"
+            )
+
+            # Process drawn shapes
+            if map_data and map_data.get("all_drawings"):
+                drawings = map_data["all_drawings"]
+                if drawings:
+                    # Get the last drawn shape
+                    last_drawing = drawings[-1]
+                    if last_drawing.get("geometry", {}).get("type") in ["Polygon", "Rectangle"]:
+                        coords = last_drawing["geometry"]["coordinates"][0]
+                        # Folium returns [lon, lat], keep as is for shapely
+                        st.session_state.mas_drawn_polygon = coords
+
+                        # Count sites in polygon using Databricks ST_Intersects (same as query)
+                        count = count_sites_in_polygon_db(coords)
+                        if count == -1:
+                            # Fallback to local count if DB query failed
+                            count = 0
+                            if not sites_df.empty:
+                                for _, row in sites_df.iterrows():
+                                    try:
+                                        lat = float(row['latitude'])
+                                        lon = float(row['longitude'])
+                                        if check_point_in_polygon(lat, lon, coords):
+                                            count += 1
+                                    except:
+                                        continue
+                        st.session_state.mas_sites_in_polygon = count
+                else:
+                    # No drawings - clear polygon if it was set
+                    if st.session_state.mas_drawn_polygon and not drawings:
+                        st.session_state.mas_drawn_polygon = None
+                        st.session_state.mas_sites_in_polygon = 0
+
+        except Exception as e:
+            st.warning(f"Could not load map: {str(e)}")
+            st.info("You can still chat with the Multi-Agent Supervisor without the map.")
+
+    with info_col:
+        st.markdown("""
+        <div style="background: #f8f9fa; border-radius: 8px; padding: 1rem; height: 100%;">
+            <h4 style="color: #1a1a1a; margin: 0 0 0.75rem 0; font-size: 0.95rem;">📌 How to Use</h4>
+            <ol style="color: #666; font-size: 0.8rem; padding-left: 1.2rem; margin: 0;">
+                <li style="margin-bottom: 0.5rem;">Click the polygon 🔷 or rectangle ⬜ tool on the map</li>
+                <li style="margin-bottom: 0.5rem;">Draw a shape around the area you want to query</li>
+                <li style="margin-bottom: 0.5rem;">Ask a question about sites in that area</li>
+            </ol>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<div style='height: 0.5rem;'></div>", unsafe_allow_html=True)
+
+        # Show polygon status
+        if st.session_state.mas_drawn_polygon:
+            st.success(f"✅ **{st.session_state.mas_sites_in_polygon}** sites selected")
+            if st.button("🗑️ Clear Selection", key="clear_mas_polygon"):
+                st.session_state.mas_drawn_polygon = None
+                st.session_state.mas_sites_in_polygon = 0
+                st.rerun()
+        else:
+            st.info("No area selected")
+
+    st.markdown("---")
+
     # Clear chat history button (only show if there's history)
     if st.session_state.mas_messages:
         if st.button("🗑️ Clear Chat History", key="clear_mas"):
             st.session_state.mas_messages = []
             st.rerun()
         st.markdown("---")
-    
+
     # Display chat history (only completed exchanges)
     for message in st.session_state.mas_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-    
+
     # Chat input
-    if prompt := st.chat_input("Ask about alerts, events, or system health..."):
+    placeholder_text = "Ask about sites in the selected area..." if st.session_state.mas_drawn_polygon else "Ask about alerts, events, or system health..."
+
+    if prompt := st.chat_input(placeholder_text):
         # Display user message (don't add to history yet)
         with st.chat_message("user"):
             st.markdown(prompt)
-        
+            if st.session_state.mas_drawn_polygon:
+                st.caption(f"🗺️ Query includes {st.session_state.mas_sites_in_polygon} sites from selected polygon")
+
+        # Build the enhanced prompt with polygon context if available
+        enhanced_prompt = prompt
+        if st.session_state.mas_drawn_polygon:
+            polygon_context = format_polygon_for_query(st.session_state.mas_drawn_polygon)
+            enhanced_prompt = f"{prompt}\n\n{polygon_context}"
+
         # Get response from Multi-Agent Supervisor
         with st.chat_message("assistant"):
             # Show progress message for long-running queries
             status_placeholder = st.empty()
             status_placeholder.info("🔄 Processing your request... Complex queries may take 2-3 minutes.")
-            
+
             try:
                 import time
                 import requests as req
-                
+
                 endpoint_name = "mas-5b54bbfa-endpoint"
-                
+
                 # Build input messages including history and current prompt
                 input_messages = [{"role": msg["role"], "content": msg["content"]} for msg in st.session_state.mas_messages]
-                input_messages.append({"role": "user", "content": prompt})
-                
+                input_messages.append({"role": "user", "content": enhanced_prompt})
+
                 # Construct request payload for agent endpoint
                 payload = {
                     "input": input_messages,
                     "databricks_options": {"return_trace": True}
                 }
-                
+
                 # Use requests with extended timeout (10 minutes)
                 # Get auth from SDK config
                 host = cfg.host.replace("https://", "").replace("http://", "")
@@ -1247,22 +1740,22 @@ def show_multi_agent_supervisor():
                 headers = {
                     'Content-Type': 'application/json'
                 }
-                
+
                 # Add auth header from SDK
                 auth_headers = dict(cfg.authenticate())
                 headers.update(auth_headers)
-                
+
                 # Make request with 10 minute timeout
                 resp = req.post(url, json=payload, headers=headers, timeout=600)
                 resp.raise_for_status()
                 response_data = resp.json()
-                
+
                 status_placeholder.empty()
-                
+
                 # Parse agent response from output array (exact pattern from working example)
                 assistant_message = ""
                 output = response_data.get("output", [])
-                
+
                 # Try primary parsing method
                 for item in output:
                     if item.get("type") == "message" and item.get("role") == "assistant":
@@ -1270,35 +1763,35 @@ def show_multi_agent_supervisor():
                         for content_item in content:
                             if content_item.get("type") == "output_text":
                                 assistant_message += content_item.get("text", "")
-                
+
                 # Fallback 1: Check if output is a string directly
                 if not assistant_message and isinstance(output, str):
                     assistant_message = output
-                
+
                 # Fallback 2: Check for text field at top level
                 if not assistant_message and isinstance(output, list):
                     for item in output:
                         if "text" in item:
                             assistant_message += str(item.get("text", ""))
-                
+
                 # Fallback 3: Try to get any content from response
                 if not assistant_message and "content" in response_data:
                     assistant_message = str(response_data.get("content", ""))
-                
+
                 # Last resort fallback message
                 if not assistant_message:
                     assistant_message = "I apologize, but I couldn't generate a response. Please try again."
                     # Add debug info in expander
                     with st.expander("🔍 Debug Info"):
                         st.json(response_data)
-                
+
                 # Display assistant response
                 st.markdown(assistant_message)
-                
+
                 # Add both user and assistant messages to history together
                 st.session_state.mas_messages.append({"role": "user", "content": prompt})
                 st.session_state.mas_messages.append({"role": "assistant", "content": assistant_message})
-            
+
             except Exception as e:
                 status_placeholder.empty()
                 error_msg = f"Error calling Multi-Agent Supervisor: {str(e)}"

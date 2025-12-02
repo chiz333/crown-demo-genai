@@ -1,0 +1,19 @@
+bundle:
+  name: lease-agreement
+
+workspace:
+  host: https://fe-vm-chi-vdm-serverless.cloud.databricks.com
+
+targets:
+  dev:
+    mode: development
+    workspace:
+      root_path: ~/.bundle/${bundle.name}/dev
+
+resources:
+  apps:
+    lease-agreement:
+      name: lease-agreement
+      description: "Lease Agreement Dashboard with Streamlit"
+      source_code_path: .
+

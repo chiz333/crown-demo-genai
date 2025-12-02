@@ -1,0 +1,7 @@
+command: ['streamlit', 'run', 'app.py']
+env:
+  - name: 'DATABRICKS_WAREHOUSE_ID'
+    value: '8c89faa0d213028c'
+  - name: 'GENIE_SPACE_ID'
+    value: '01f0c9ca21941df6a2436841e0353279'
+

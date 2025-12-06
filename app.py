@@ -488,21 +488,35 @@ st.markdown("""
 cfg = Config()
 w = WorkspaceClient()
 
-# Initialize connection
-@st.cache_resource
+# Initialize connection with auto-reconnect
 def get_connection():
+    """Get a fresh SQL connection each time to avoid stale connections"""
     return sql.connect(
         server_hostname=cfg.host,
         http_path=f"/sql/1.0/warehouses/{os.environ.get('DATABRICKS_WAREHOUSE_ID')}",
         credentials_provider=lambda: cfg.authenticate
     )
 
-# Query data
-@st.cache_data(ttl=300)
-def query_data(state_filter=None, doc_type_filter=None, tenant_filter=None):
-    conn = get_connection()
-    cursor = conn.cursor()
+def execute_query_with_retry(query, max_retries=2):
+    """Execute a query with automatic retry on connection errors"""
+    for attempt in range(max_retries):
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(query)
+            result = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            cursor.close()
+            conn.close()
+            return result, columns
+        except Exception as e:
+            if attempt < max_retries - 1:
+                continue  # Retry
+            raise e
 
+# Query data
+@st.cache_data(ttl=60)  # Shorter TTL to refresh data more often
+def query_data(state_filter=None, doc_type_filter=None, tenant_filter=None):
     query = """
     SELECT 
         site_name,
@@ -516,7 +530,8 @@ def query_data(state_filter=None, doc_type_filter=None, tenant_filter=None):
         days_until_expiration,
         revenue_per_sqft,
         insurance_liability_min_usd,
-        equipment_space_sqft
+        equipment_space_sqft,
+        compliance_status
     FROM bricks_demo.crown_demo.synth_data
     WHERE latitude IS NOT NULL 
         AND longitude IS NOT NULL
@@ -530,48 +545,36 @@ def query_data(state_filter=None, doc_type_filter=None, tenant_filter=None):
     if tenant_filter and tenant_filter != "All":
         query += f" AND tenant_name = '{tenant_filter}'"
 
-    cursor.execute(query)
-    result = cursor.fetchall()
-    columns = [desc[0] for desc in cursor.description]
-    cursor.close()
-
+    result, columns = execute_query_with_retry(query)
     return pd.DataFrame(result, columns=columns)
 
 # Get filter options
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)  # Shorter TTL
 def get_filter_options():
-    conn = get_connection()
-    cursor = conn.cursor()
-
     # States
-    cursor.execute("SELECT DISTINCT state FROM bricks_demo.crown_demo.synth_data WHERE state IS NOT NULL ORDER BY state")
-    states = ["All"] + [row[0] for row in cursor.fetchall()]
+    result, _ = execute_query_with_retry("SELECT DISTINCT state FROM bricks_demo.crown_demo.synth_data WHERE state IS NOT NULL ORDER BY state")
+    states = ["All"] + [row[0] for row in result]
 
     # Document types
-    cursor.execute("SELECT DISTINCT document_type FROM bricks_demo.crown_demo.synth_data WHERE document_type IS NOT NULL ORDER BY document_type")
-    doc_types = ["All"] + [row[0] for row in cursor.fetchall()]
+    result, _ = execute_query_with_retry("SELECT DISTINCT document_type FROM bricks_demo.crown_demo.synth_data WHERE document_type IS NOT NULL ORDER BY document_type")
+    doc_types = ["All"] + [row[0] for row in result]
 
     # Tenants
-    cursor.execute("SELECT DISTINCT tenant_name FROM bricks_demo.crown_demo.synth_data WHERE tenant_name IS NOT NULL ORDER BY tenant_name")
-    tenants = ["All"] + [row[0] for row in cursor.fetchall()]
+    result, _ = execute_query_with_retry("SELECT DISTINCT tenant_name FROM bricks_demo.crown_demo.synth_data WHERE tenant_name IS NOT NULL ORDER BY tenant_name")
+    tenants = ["All"] + [row[0] for row in result]
 
-    cursor.close()
     return states, doc_types, tenants
 
 # Get site locations for Genie map
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)  # Shorter TTL
 def get_site_locations():
     """Fetch all site locations for displaying on the Genie map"""
-    conn = get_connection()
-    cursor = conn.cursor()
-
     query = """
     SELECT 
         site_name,
         latitude,
         longitude,
         state,
-        city,
         tenant_name,
         total_monthly_revenue
     FROM bricks_demo.crown_demo.synth_data
@@ -579,11 +582,7 @@ def get_site_locations():
         AND longitude IS NOT NULL
     """
 
-    cursor.execute(query)
-    result = cursor.fetchall()
-    columns = [desc[0] for desc in cursor.description]
-    cursor.close()
-
+    result, columns = execute_query_with_retry(query)
     return pd.DataFrame(result, columns=columns)
 
 def check_point_in_polygon(lat, lon, polygon_coords):
@@ -613,9 +612,6 @@ def count_sites_in_polygon_db(polygon_coords):
 
         wkt_polygon = f"POLYGON(({wkt_coords}))"
 
-        conn = get_connection()
-        cursor = conn.cursor()
-
         query = f"""
         SELECT COUNT(DISTINCT site_name) as cnt
         FROM bricks_demo.crown_demo.synth_data
@@ -627,11 +623,8 @@ def count_sites_in_polygon_db(polygon_coords):
             )
         """
 
-        cursor.execute(query)
-        result = cursor.fetchone()
-        cursor.close()
-
-        return result[0] if result else 0
+        result, _ = execute_query_with_retry(query)
+        return result[0][0] if result else 0
     except Exception as e:
         # Fall back to local calculation if DB query fails
         return -1  # Return -1 to indicate error
@@ -795,12 +788,42 @@ def show_dashboard():
             </div>
             ''', unsafe_allow_html=True)
         with metric4:
-            st.markdown(f'''
-            <div class="metric-card">
-                <div class="metric-label metric-label-red">📐 Revenue / Sq Ft</div>
-                <div class="metric-value">${avg_revenue_per_sqft:,.2f}</div>
-            </div>
-            ''', unsafe_allow_html=True)
+            # Check if single site is selected
+            if st.session_state.selected_site and num_leases == 1:
+                # Single site: show actual compliance status from data
+                status_text = df['compliance_status'].iloc[0] if 'compliance_status' in df.columns and len(df) > 0 else "Unknown"
+                status_text = str(status_text) if pd.notna(status_text) else "Unknown"
+                
+                # Color based on status text
+                status_lower = status_text.lower()
+                if 'compliant' in status_lower and 'non' not in status_lower:
+                    compliance_color = "metric-label-green"
+                elif 'pending' in status_lower:
+                    compliance_color = "metric-label-orange"
+                else:
+                    compliance_color = "metric-label-red"
+                
+                st.markdown(f'''
+                <div class="metric-card">
+                    <div class="metric-label {compliance_color}">✅ Compliance Status</div>
+                    <div class="metric-value">{status_text}</div>
+                </div>
+                ''', unsafe_allow_html=True)
+            else:
+                # Multiple sites: show percentage of compliant sites
+                if 'compliance_status' in df.columns:
+                    compliant_count = len(df[df['compliance_status'].str.lower().str.contains('compliant', na=False) & ~df['compliance_status'].str.lower().str.contains('non', na=False)])
+                    compliance_rate = (compliant_count / num_leases * 100) if num_leases > 0 else 0
+                else:
+                    compliance_rate = 0
+                
+                compliance_color = "metric-label-green" if compliance_rate >= 80 else "metric-label-orange" if compliance_rate >= 50 else "metric-label-red"
+                st.markdown(f'''
+                <div class="metric-card">
+                    <div class="metric-label {compliance_color}">✅ Compliance Status</div>
+                    <div class="metric-value">{compliance_rate:.0f}%</div>
+                </div>
+                ''', unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1056,7 +1079,6 @@ def show_genie_space():
                         lon = float(row['longitude'])
                         site_name = str(row['site_name'])
                         state = str(row.get('state', 'N/A'))
-                        city = str(row.get('city', 'N/A'))
                         revenue = row.get('total_monthly_revenue', 0)
 
                         # Check if site is in selected polygon
@@ -1070,7 +1092,7 @@ def show_genie_space():
                         popup_html = f"""
                         <div style="font-family: Arial; width: 200px;">
                             <b>{site_name}</b><br>
-                            📍 {city}, {state}<br>
+                            📍 {state}<br>
                             💰 ${revenue:,.0f}/month
                         </div>
                         """
@@ -1580,7 +1602,6 @@ def show_multi_agent_supervisor():
                         lon = float(row['longitude'])
                         site_name = str(row['site_name'])
                         state = str(row.get('state', 'N/A'))
-                        city = str(row.get('city', 'N/A'))
                         revenue = row.get('total_monthly_revenue', 0)
 
                         # Check if site is in selected polygon
@@ -1594,7 +1615,7 @@ def show_multi_agent_supervisor():
                         popup_html = f"""
                         <div style="font-family: Arial; width: 200px;">
                             <b>{site_name}</b><br>
-                            📍 {city}, {state}<br>
+                            📍 {state}<br>
                             💰 ${revenue:,.0f}/month
                         </div>
                         """
